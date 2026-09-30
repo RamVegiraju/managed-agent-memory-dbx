@@ -14,11 +14,11 @@ from databricks_agentkit import AgentKitClient
 from databricks_agentkit.memory_store import Memory, MemoryStore
 from databricks_agentkit.session_store import Session, SessionStore
 
-Trace = Callable[[str, dict[str, Any]], None]
+ActivityObserver = Callable[[str, dict[str, Any]], None]
 
 
-def quiet_trace(event: str, details: dict[str, Any]) -> None:
-    """Ignore trace events when no observer is configured."""
+def quiet_observer(event: str, details: dict[str, Any]) -> None:
+    """Ignore activity events when no observer is configured."""
 
 
 class Backend:
@@ -29,7 +29,7 @@ class Backend:
         memory_store: Existing managed memory store.
         actor_id: Verified caller ID, resolved by trusted application code.
         namespace: Prefix reserved for this sample's memory entries.
-        trace: Observer for API activity; never receives authentication tokens.
+        observer: Callback for API activity; never receives authentication tokens.
     """
 
     def __init__(
@@ -38,7 +38,7 @@ class Backend:
         memory_store: MemoryStore,
         actor_id: str,
         namespace: str = "/preferences/",
-        trace: Trace = quiet_trace,
+        observer: ActivityObserver = quiet_observer,
     ) -> None:
         if not actor_id.strip():
             raise ValueError("A verified actor ID is required; shared fallback is not allowed.")
@@ -48,12 +48,12 @@ class Backend:
         self.memory_store = memory_store
         self.actor_id = actor_id
         self.namespace = namespace
-        self.trace = trace
+        self.observer = observer
 
     def new_session(self) -> Session:
         """Create a caller-chosen ID and recover a committed create with bounded reads."""
         session_id = str(uuid4())
-        self.trace("session.creating", {"session_id": session_id})
+        self.observer("session.creating", {"session_id": session_id})
         try:
             session = self.session_store.add(actor_id=self.actor_id, session_id=session_id)
         except AgentCliError as create_error:
@@ -64,14 +64,14 @@ class Backend:
                     session = self.session(session_id)
                 except AgentCliError:
                     continue
-                self.trace(
+                self.observer(
                     "session.create_recovered",
                     {"session_id": session_id, "read_attempts": attempt + 1},
                 )
                 break
             else:
                 raise create_error
-        self.trace("session.created", {"session_id": session.session_id})
+        self.observer("session.created", {"session_id": session.session_id})
         return session
 
     def session(self, session_id: str) -> Session:
@@ -99,18 +99,18 @@ class Backend:
             }:
                 raise ValueError("Unsupported session item; this sample stores chat messages only.")
             history.append(item.data)
-        self.trace("session.loaded", {"session_id": session_id, "items": len(history)})
+        self.observer("session.loaded", {"session_id": session_id, "items": len(history)})
         return history
 
     def append(self, session_id: str, messages: list[dict[str, Any]]) -> None:
         """Append one completed turn, including any memory tool calls and results."""
         self.session(session_id).append_items(messages)
-        self.trace("session.appended", {"session_id": session_id, "items": len(messages)})
+        self.observer("session.appended", {"session_id": session_id, "items": len(messages)})
 
     def delete_session(self, session_id: str) -> None:
         """Delete one owned session, without cascading to branches or touching memory."""
         self.session(session_id).delete()
-        self.trace("session.deleted", {"session_id": session_id})
+        self.observer("session.deleted", {"session_id": session_id})
 
     def memories(self) -> list[Memory]:
         """Inspect memory through the list API, not a relevance-limited search."""
@@ -132,7 +132,7 @@ class Backend:
             }
             for result in results
         ]
-        self.trace("memory.searched", {"query": query, "results": recalled})
+        self.observer("memory.searched", {"query": query, "results": recalled})
         return recalled
 
     def remember(self, topic: str, content: str) -> dict[str, str]:
@@ -153,7 +153,7 @@ class Backend:
                 description=description,
             )
             action = "created"
-        self.trace(f"memory.{action}", {"path": path, "content": content})
+        self.observer(f"memory.{action}", {"path": path, "content": content})
         return {"status": action, "path": path}
 
     def forget(self, topic: str) -> dict[str, str]:
@@ -162,7 +162,7 @@ class Backend:
         existing = self._find(path)
         if existing:
             existing.delete()
-        self.trace("memory.forgotten", {"path": path, "existed": existing is not None})
+        self.observer("memory.forgotten", {"path": path, "existed": existing is not None})
         return {"status": "deleted" if existing else "not_found", "path": path}
 
     def _path(self, topic: str) -> str:
@@ -194,7 +194,7 @@ def connect(
     session_store: str,
     memory_store: str,
     namespace: str = "/preferences/",
-    trace: Trace = quiet_trace,
+    observer: ActivityObserver | None = None,
 ) -> Backend:
     """Open existing stores; never provision infrastructure implicitly."""
     actor_id = caller_id(workspace)
@@ -204,7 +204,7 @@ def connect(
         client.memory_stores.get(memory_store),
         actor_id,
         namespace,
-        trace,
+        observer or quiet_observer,
     )
 
 

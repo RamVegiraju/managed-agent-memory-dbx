@@ -19,7 +19,7 @@ from memory_demo.backend import Backend, caller_id, connect, initialize
 from memory_demo.demo import run_demo
 
 
-def trace(event: str, details: dict[str, Any]) -> None:
+def show_activity(event: str, details: dict[str, Any]) -> None:
     """Print inspectable API activity without credentials or private model reasoning."""
     print(f"\n[{event}] {json.dumps(details, ensure_ascii=False, default=str)}")
 
@@ -48,7 +48,7 @@ def parser() -> argparse.ArgumentParser:
         "--memory-store", default=os.getenv("DEMO_MEMORY_STORE", "memory-demo-memory")
     )
     result.add_argument(
-        "--trace", action="store_true", help="Show memory contents and API activity"
+        "--verbose", action="store_true", help="Show memory contents and API activity"
     )
     commands = result.add_subparsers(dest="command", required=True)
     commands.add_parser("doctor", help="Read-only authentication, endpoint, and store discovery")
@@ -59,7 +59,17 @@ def parser() -> argparse.ArgumentParser:
     demo.add_argument("--cleanup", action="store_true", help="Delete only this run's artifacts")
     chat = commands.add_parser("chat", help="Chat with approved remember/recall/forget tools")
     chat.add_argument("--session-id", help="Resume an owned session instead of creating one")
+    inspect = commands.add_parser("inspect", help="Retrieve the current user's saved data")
+    inspect.add_argument("--user-id", required=True, help="Authenticated Databricks user ID")
+    inspect.add_argument("--session-id", help="Also retrieve one session's complete history")
     return result
+
+
+def requires_model(arguments: argparse.Namespace) -> bool:
+    """Return whether this command invokes a model endpoint."""
+    return arguments.command == "chat" or (
+        arguments.command == "demo" and not arguments.storage_only
+    )
 
 
 def validate(arguments: argparse.Namespace) -> None:
@@ -75,10 +85,7 @@ def validate(arguments: argparse.Namespace) -> None:
             "init provisions billable Lakebase backing. Review the README, "
             "then explicitly accept with init --yes."
         )
-    needs_model = arguments.command == "chat" or (
-        arguments.command == "demo" and not arguments.storage_only
-    )
-    if needs_model and (not arguments.model or not arguments.model.strip()):
+    if requires_model(arguments) and (not arguments.model or not arguments.model.strip()):
         raise ValueError("Pass --model ENDPOINT or set DATABRICKS_MODEL; doctor lists endpoints.")
 
 
@@ -141,6 +148,41 @@ def chat(backend: Backend, model: DatabricksModel, session_id: str | None) -> No
             print(f"\nAgent> {agent.ask(session.session_id, text)}")
 
 
+def inspect(backend: Backend, user_id: str, session_id: str | None = None) -> None:
+    """Print sessions and memories for the authenticated user, plus an optional transcript."""
+    if user_id != backend.actor_id:
+        raise PermissionError("--user-id must match the authenticated Databricks caller.")
+
+    sessions = backend.sessions()
+    result: dict[str, Any] = {
+        "user_id": user_id,
+        "sessions": [
+            {
+                "session_id": session.session_id,
+                "create_time": session.create_time,
+            }
+            for session in sessions
+        ],
+        "memories": [
+            {
+                "path": memory.path,
+                "description": memory.description,
+                "content": memory.content,
+                "session_id": memory.session_id,
+            }
+            for memory in backend.memories()
+        ],
+    }
+    if session_id:
+        session = backend.session(session_id)
+        result["session"] = {
+            "session_id": session.session_id,
+            "create_time": session.create_time,
+            "history": backend.history(session.session_id),
+        }
+    print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+
+
 def main() -> int:
     """Run the sample with explicit auth and actionable preview/API errors."""
     arguments = parser().parse_args()
@@ -154,20 +196,19 @@ def main() -> int:
             initialize(workspace, arguments.session_store, arguments.memory_store)
             print("Stores ready. No automatic provisioning occurs in chat or demo.")
             return 0
-        observer = trace if arguments.trace else None
+        observer = show_activity if arguments.verbose else None
 
         def factory(namespace: str) -> Backend:
-            options = {"trace": observer} if observer else {}
             return connect(
                 workspace,
                 arguments.session_store,
                 arguments.memory_store,
                 namespace,
-                **options,
+                observer,
             )
 
         model = None
-        if arguments.model and not getattr(arguments, "storage_only", False):
+        if requires_model(arguments):
             from databricks_openai import DatabricksOpenAI
 
             check_model(workspace, arguments.model)
@@ -178,6 +219,8 @@ def main() -> int:
             )
         if arguments.command == "demo":
             run_demo(factory, model, arguments.cleanup)
+        elif arguments.command == "inspect":
+            inspect(factory("/preferences/"), arguments.user_id, arguments.session_id)
         else:
             if model is None:
                 raise ValueError("A chat model endpoint is required.")

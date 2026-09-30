@@ -69,7 +69,7 @@ export DATABRICKS_MODEL=databricks-gpt-5-6-sol
 export DATABRICKS_REASONING_EFFORT=none
 uv run memory-demo doctor
 uv run memory-demo init --yes
-uv run memory-demo --trace demo --cleanup
+uv run memory-demo --verbose demo --cleanup
 ```
 
 Choose another available tool-calling model if this endpoint is not listed in your workspace.

@@ -16,13 +16,12 @@ The sample runs on a laptop or any Python environment with access to an enabled 
 similarity. Although the introduction mentions semantic search, this sample does not claim
 embedding-based or guaranteed synonym retrieval. Short descriptions and meaningful query terms matter.
 
-## Quickstart
+## Run the sample
 
-Requirements:
-- Python 3.10+ and [uv](https://docs.astral.sh/uv/getting-started/installation/).
-- A Databricks workspace with the managed sessions and memory preview enabled.
-- An explicitly selected, authenticated Databricks CLI profile.
-- For chat, permission to invoke an existing chat endpoint that supports function/tool calling.
+Requirements: Python 3.10+, [uv](https://docs.astral.sh/uv/getting-started/installation/),
+the Databricks CLI, an enabled workspace, and permission to use a tool-calling chat endpoint.
+
+### 1. Install and authenticate
 
 ```bash
 uv sync
@@ -31,103 +30,112 @@ export DATABRICKS_CONFIG_PROFILE=YOUR_PROFILE
 uv run memory-demo doctor
 ```
 
-`doctor` is read-only: it resolves the authenticated identity, lists chat endpoints, and lists
-both store types. It neither creates infrastructure nor invokes a model. Choose a listed,
-tool-calling endpoint; model names differ by workspace.
+`doctor` is read-only. It prints the authenticated user ID, available chat endpoints, and existing
+session and memory stores. It does not create resources or invoke a model.
 
-For GPT-5.6-Sol, Chat Completions function tools require reasoning to be disabled:
-set `DATABRICKS_REASONING_EFFORT=none` or pass the global `--reasoning-effort none` flag.
-The setting is optional and omitted by default because other endpoints may not support it.
+### 2. Configure the model and stores
+
+Choose an endpoint printed by `doctor`:
 
 ```bash
 export DATABRICKS_MODEL=YOUR_CHAT_ENDPOINT
+# Required for GPT-5.6-Sol tool calls; omit for models that do not support this option.
+export DATABRICKS_REASONING_EFFORT=none
+
+# Run once. This creates only the two missing stores.
 uv run memory-demo init --yes
-uv run memory-demo --trace demo --cleanup
-uv run memory-demo --trace chat
 ```
 
-**Cost:** `init --yes` explicitly provisions missing stores and their billable Lakebase backing.
-Model calls also incur normal inference costs. Chat and demo only open existing stores.
-`--cleanup` removes this demo run's sessions/entries, **not** the backing stores; those may
-continue incurring costs. Delete dedicated stores through the official SDK/CLI when finished,
-after checking they contain nothing you want to retain.
+**Cost:** `init --yes` can provision billable Lakebase backing. Chat and demo commands only open
+existing stores. The defaults are `memory-demo-sessions` and `memory-demo-memory`.
 
-Flags can replace environment variables. Global flags go **before** the subcommand:
+### 3. Demonstrate cross-session memory
+
+```bash
+uv run memory-demo --verbose chat
+```
+
+Enter the following, approving the memory write with `y`:
+
+```text
+Remember that I prefer concise answers with PySpark examples.
+/memories
+/new
+/history
+Use my saved response preferences to explain deduplication.
+/sessions
+```
+
+What this proves:
+
+- `/new` creates a different session and `/history` initially returns `[]`.
+- The verbose `[memory.searched]` event shows the agent calling managed memory.
+- The new session still uses the preference saved in the first session.
+- `/sessions` lists both transcripts while `/memories` lists the independent durable preference.
+
+For a process-restart check, run `/quit`, start `chat` again, and ask for an answer using your saved
+preferences. The memory remains because it is partitioned by authenticated user, not session ID.
+
+### 4. Retrieve persisted data
+
+Copy the user ID printed by `doctor`:
+
+```bash
+uv run memory-demo inspect --user-id YOUR_DATABRICKS_USER_ID
+```
+
+Copy a `session_id` from the returned `sessions` array to retrieve its complete history:
+
+```bash
+uv run memory-demo inspect \
+  --user-id YOUR_DATABRICKS_USER_ID \
+  --session-id YOUR_SESSION_ID
+```
+
+The output is JSON. The sample permits only the authenticated caller's user ID; it does not permit
+arbitrary cross-user access.
+
+### 5. Run the automated showcase
+
+```bash
+# Real storage APIs, no model cost
+uv run memory-demo --verbose demo --storage-only --cleanup
+
+# Real storage APIs plus model responses
+uv run memory-demo --verbose demo --cleanup
+```
+
+The demo verifies session reload, a fresh empty session, cross-session recall, update, independent
+session deletion, and explicit forgetting. It uses an isolated namespace. `--cleanup` removes only
+that run's sessions and entries; it does not delete the stores or their backing infrastructure.
+
+## Memory tools
+
+The model receives three simple function tools defined in `src/memory_demo/agent.py`:
+
+| Tool | Managed-memory operation |
+| --- | --- |
+| `recall(query)` | Search this user's durable entries |
+| `remember(topic, content)` | Create or update one stable topic after approval |
+| `forget(topic)` | Delete one stable topic after approval |
+
+This intentionally combines lower-level create/get/list/update/delete operations into a smaller
+agent interface. Memory extraction is not automatic: the model must call `remember`, and durable
+facts are available in a new session only after it calls `recall`.
+
+## Configuration
+
+There is no automatic `DEFAULT` profile or hard-coded model. Environment variables can be replaced
+with global flags placed **before** the subcommand:
 
 ```bash
 uv run memory-demo --profile YOUR_PROFILE --model YOUR_CHAT_ENDPOINT \
-  --session-store YOUR_SESSIONS --memory-store YOUR_MEMORY --trace demo
+  --session-store YOUR_SESSIONS --memory-store YOUR_MEMORY --verbose demo --cleanup
 ```
 
-There is no automatic `DEFAULT` profile or hard-coded model fallback. Existing stores can be
-used by setting `DEMO_SESSION_STORE` and `DEMO_MEMORY_STORE`, or passing the matching flags.
-The defaults are `memory-demo-sessions` and `memory-demo-memory`.
-
-To test the storage APIs without model costs:
-
-```bash
-uv run memory-demo --profile YOUR_PROFILE --trace demo --storage-only --cleanup
-```
-
-This still uses **real managed stores**. It is not an offline emulator.
-
-## What the scripted demo proves
-
-The demo seeds a clearly labelled fixture: a session-only `nightly-orders` job context and
-a separately saved preference for concise PySpark examples. It uses a unique memory namespace
-per run, so it never modifies your interactive chat preferences.
-
-1. Create Session A and save an ordered transcript.
-2. Save one explicit durable preference; this is not automatic transcript extraction.
-3. Open fresh API resource objects and reload A's history, without an in-process transcript cache.
-4. Create Session B and assert its history is empty.
-5. Search for the saved preference and verify the temporary job was not saved as memory.
-6. Update the same topic to SQL examples and verify there is still just one entry.
-7. Delete A and verify the durable preference survives independently.
-8. Forget the preference and verify the memory inventory is empty.
-
-With a model configured, it also prints responses from resumed A, fresh B, and a fresh C after
-forgetting. Storage checks are asserted; model wording and tool choices are illustrative and not
-graded. A search failure is surfaced, not concealed by silently listing all memories.
-
-The fresh API client check proves storage reloading, not an actual process restart. To demonstrate
-that separately, quit chat and restart it with `--session-id` as shown below.
-
-## Interactive walkthrough
-
-In `chat`, enter:
-
-```text
-Remember my response preferences: concise answers with PySpark examples.
-```
-
-Approve the proposed memory write with `y`. Then:
-
-```text
-For this conversation only, we're troubleshooting nightly-orders.
-Which job are we troubleshooting?
-/memories
-/history
-/new
-Use my saved response preferences to show a deduplication example.
-What job are we troubleshooting in this new conversation?
-```
-
-The new thread has no old transcript; only explicitly retrieved memory can personalize its answer.
-Try updating the preference to SQL and asking to forget it, approving each mutation. Start a
-**fresh thread** when demonstrating updated/forgotten memory: old transcripts still contain
-previously mentioned or retrieved facts. Forgetting does not redact those transcripts.
-
-Commands: `/new`, `/resume ID`, `/sessions`, `/history`, `/memories`, `/quit`.
-The current session ID is printed when chat starts. Stop the process, then resume it:
-
-```bash
-uv run memory-demo --trace chat --session-id YOUR_SESSION_ID
-```
-
-`--trace` prints activity, memory queries/results, and writes. It does not print credentials
-or hidden model reasoning, but it **does print user memory contents**: do not share traces or
-use sensitive demo data.
+Commands: `doctor`, `init`, `chat`, `inspect`, and `demo`. Run `uv run memory-demo --help` for all
+global options. In chat, use `/new`, `/resume ID`, `/sessions`, `/history`, `/memories`, or `/quit`.
+`--verbose` can print user memory contents; do not share its output or use sensitive demo data.
 
 ## Code map
 

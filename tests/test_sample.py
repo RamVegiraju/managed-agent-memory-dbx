@@ -12,7 +12,7 @@ from databricks_agentbricks.errors import AgentCliError
 
 from memory_demo.agent import TOOLS, Agent, DatabricksModel
 from memory_demo.backend import Backend, caller_id
-from memory_demo.cli import check_model, parser, validate
+from memory_demo.cli import check_model, inspect, parser, validate
 from memory_demo.demo import run_demo
 from tests.fakes import FakeMemoryStore, FakeSessionStore, ScriptedModel
 
@@ -295,6 +295,62 @@ def test_storage_only_requires_no_model(monkeypatch: pytest.MonkeyPatch) -> None
     validate(parser().parse_args(["--profile", "chosen", "demo", "--storage-only"]))
     with pytest.raises(ValueError, match="--model"):
         validate(parser().parse_args(["--profile", "chosen", "chat"]))
+
+
+def test_inspect_lists_user_sessions_and_memories(capsys: pytest.CaptureFixture[str]) -> None:
+    sessions = FakeSessionStore()
+    memories = FakeMemoryStore()
+    backend = Backend(sessions, memories, "verified-user")
+    session = backend.new_session()
+    backend.append(session.session_id, [{"role": "user", "content": "Hello"}])
+    backend.remember("response-preferences", "Concise PySpark examples")
+
+    inspect(backend, "verified-user")
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["user_id"] == "verified-user"
+    assert result["sessions"][0]["session_id"] == session.session_id
+    assert result["memories"][0]["content"] == "Concise PySpark examples"
+    assert "session" not in result
+
+
+def test_inspect_retrieves_complete_session_history(capsys: pytest.CaptureFixture[str]) -> None:
+    backend = Backend(FakeSessionStore(), FakeMemoryStore(), "verified-user")
+    session = backend.new_session()
+    backend.append(
+        session.session_id,
+        [
+            {"role": "user", "content": "First"},
+            {"role": "assistant", "content": "Second"},
+        ],
+    )
+
+    inspect(backend, "verified-user", session.session_id)
+
+    result = json.loads(capsys.readouterr().out)
+    assert [item["content"] for item in result["session"]["history"]] == ["First", "Second"]
+    assert session.last_order == "create_time asc"
+
+
+def test_inspect_rejects_another_user_before_store_retrieval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = Backend(FakeSessionStore(), FakeMemoryStore(), "verified-user")
+    monkeypatch.setattr(backend, "sessions", lambda: pytest.fail("sessions were retrieved"))
+    monkeypatch.setattr(backend, "memories", lambda: pytest.fail("memories were retrieved"))
+
+    with pytest.raises(PermissionError, match="authenticated"):
+        inspect(backend, "another-user")
+
+
+def test_inspect_parser_uses_verbose_not_trace() -> None:
+    arguments = parser().parse_args(
+        ["--profile", "chosen", "--verbose", "inspect", "--user-id", "verified-user"]
+    )
+    assert arguments.verbose is True
+    assert arguments.user_id == "verified-user"
+    with pytest.raises(SystemExit):
+        parser().parse_args(["--profile", "chosen", "--trace", "doctor"])
 
 
 def test_model_uses_selected_endpoint_and_no_tool_calls_on_last_round() -> None:
