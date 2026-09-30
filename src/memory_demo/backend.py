@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from time import sleep
 from typing import Any
 from uuid import uuid4
 
@@ -50,17 +51,26 @@ class Backend:
         self.trace = trace
 
     def new_session(self) -> Session:
-        """Create a caller-chosen ID and recover a committed create by read, never write retry."""
+        """Create a caller-chosen ID and recover a committed create with bounded reads."""
         session_id = str(uuid4())
         self.trace("session.creating", {"session_id": session_id})
         try:
             session = self.session_store.add(actor_id=self.actor_id, session_id=session_id)
         except AgentCliError as create_error:
-            try:
-                session = self.session(session_id)
-            except AgentCliError:
+            for attempt in range(5):
+                if attempt:
+                    sleep(1)
+                try:
+                    session = self.session(session_id)
+                except AgentCliError:
+                    continue
+                self.trace(
+                    "session.create_recovered",
+                    {"session_id": session_id, "read_attempts": attempt + 1},
+                )
+                break
+            else:
                 raise create_error
-            self.trace("session.create_recovered", {"session_id": session_id})
         self.trace("session.created", {"session_id": session.session_id})
         return session
 

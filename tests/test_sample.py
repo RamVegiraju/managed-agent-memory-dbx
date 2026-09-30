@@ -45,21 +45,34 @@ def test_session_resume_and_fresh_thread(backend: Backend) -> None:
     assert reopened.history(reopened.new_session().session_id) == []
 
 
-def test_session_creation_recovers_lost_response_without_repeating_write() -> None:
+def test_session_creation_recovers_lost_response_without_repeating_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reads = 0
+
     class LostResponseStore(FakeSessionStore):
         def add(self, actor_id: str, session_id: str | None = None) -> Any:
             super().add(actor_id, session_id)
             raise AgentCliError("Response ended prematurely")
 
+        def get(self, session_id: str) -> Any:
+            nonlocal reads
+            reads += 1
+            if reads < 3:
+                raise AgentCliError("Not found yet")
+            return super().get(session_id)
+
+    monkeypatch.setattr("memory_demo.backend.sleep", lambda seconds: None)
     store = LostResponseStore()
     backend = Backend(store, FakeMemoryStore(), "verified-user")
     recovered = backend.new_session()
     assert recovered.actor_id == "verified-user"
     assert store.counter == 1
+    assert reads == 3
     assert len(store.entries) == 1
 
 
-def test_failed_session_create_preserves_original_error() -> None:
+def test_failed_session_create_preserves_original_error(monkeypatch: pytest.MonkeyPatch) -> None:
     class FailedStore(FakeSessionStore):
         def add(self, actor_id: str, session_id: str | None = None) -> Any:
             self.counter += 1
@@ -68,6 +81,7 @@ def test_failed_session_create_preserves_original_error() -> None:
         def get(self, session_id: str) -> Any:
             raise AgentCliError("Not found")
 
+    monkeypatch.setattr("memory_demo.backend.sleep", lambda seconds: None)
     store = FailedStore()
     backend = Backend(store, FakeMemoryStore(), "verified-user")
     with pytest.raises(AgentCliError, match="Create failed"):

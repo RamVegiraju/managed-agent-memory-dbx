@@ -40,10 +40,10 @@ Multi-user authorization and concurrent writers were not validated live.
 
 ## Compatibility fixes found during validation
 
-1. **Session create response loss:** one create returned `Response ended prematurely` despite
-   committing. Sessions now have client-assigned UUIDs. After a create error, one read-only lookup
-   can recover the exact session without repeating the write. The recovery/error paths have
-   regression tests; subsequent live UUID-based creates passed.
+1. **Session create response loss:** creates returned `Response ended prematurely` or `CANCELLED`
+   despite committing. Sessions use client-assigned UUIDs. After a create error, bounded read-only
+   lookups recover the exact session after propagation without repeating the write. The recovery
+   and original-error paths have regression tests.
 2. **SDK readiness enum:** the SDK returns `EndpointStateReady.READY`, not a plain string.
    Readiness checks now accept the enum value as well as a string.
 3. **Sol tool-call setting:** GPT-5.6-Sol rejected Chat Completions function tools with default
@@ -56,6 +56,18 @@ Both dedicated validation stores were deleted through the managed-store APIs, af
 remaining sessions were known synthetic test artifacts and the caller's memory inventory was empty.
 Their absence was then verified using both store-list APIs. No validation store remains.
 The underlying managed Lakebase instance lifecycle was not independently audited.
+
+## Retained infrastructure observation
+
+A later retained run created `memory-demo-sessions` and `memory-demo-memory`, then completed two
+GPT-5.6-Sol conversations: one explicitly saved a response preference and a separate session
+retrieved it. The stores and records were intentionally left in place for inspection.
+
+Databricks reused the existing `databricks-internal-custom-agents` Lakebase project, its
+`production` branch, and its `primary` endpoint. Store creation added two PostgreSQL databases:
+`session-memory-demo-sessions` and `memory-memory-demo-memory`. The memory store API explicitly
+reported the latter in `storage_backend.backend_id`; the session database matched the store name
+and creation timestamp in Lakebase. No new Lakebase project or endpoint was created for this run.
 
 The offline suite passes **38 tests**. Ruff lint, Ruff format checks, and Pyright pass.
 

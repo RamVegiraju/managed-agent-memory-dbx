@@ -157,9 +157,10 @@ including the source session in the entry's unique key would make one topic diff
 - Use one writer per conversation. The sample does not implement concurrent-turn locking,
   atomic read/modify/write upserts, or exactly-once execution. If model/tool execution fails after
   a write, inspect memory before retrying: the write may already have committed.
-- Sessions use client-assigned UUIDs. If a create response is lost, the sample tries one
-  read-only lookup of that exact ID and verifies ownership; it never automatically repeats
-  the create request. A failed lookup surfaces the original create error.
+- Sessions use client-assigned UUIDs. If a create response is lost, the sample makes a few
+  bounded read-only lookups of that exact ID and verifies ownership; it never automatically
+  repeats the create request. If the committed session does not become visible, the original
+  create error is surfaced.
 - The whole completed turn is appended once. If a process crashes during generation, the in-flight
   turn is not a durable resumable run. Managed sessions are transcript storage, not execution control.
 - Store creation is not transactional across the two APIs. If one succeeds and the second fails,
