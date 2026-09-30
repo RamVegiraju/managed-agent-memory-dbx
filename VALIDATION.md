@@ -57,18 +57,6 @@ remaining sessions were known synthetic test artifacts and the caller's memory i
 Their absence was then verified using both store-list APIs. No validation store remains.
 The underlying managed Lakebase instance lifecycle was not independently audited.
 
-## Retained infrastructure observation
-
-A later retained run created `memory-demo-sessions` and `memory-demo-memory`, then completed two
-GPT-5.6-Sol conversations: one explicitly saved a response preference and a separate session
-retrieved it. The stores and records were intentionally left in place for inspection.
-
-Databricks reused the existing `databricks-internal-custom-agents` Lakebase project, its
-`production` branch, and its `primary` endpoint. Store creation added two PostgreSQL databases:
-`session-memory-demo-sessions` and `memory-memory-demo-memory`. The memory store API explicitly
-reported the latter in `storage_backend.backend_id`; the session database matched the store name
-and creation timestamp in Lakebase. No new Lakebase project or endpoint was created for this run.
-
 The offline suite passes **38 tests**. Ruff lint, Ruff format checks, and Pyright pass.
 
 ## Reproduce in another workspace
