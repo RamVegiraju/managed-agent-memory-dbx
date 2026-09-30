@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "databricks-memory-demo"
+version = "0.1.0"
+description = "A small, workspace-agnostic demo of managed agent sessions and memory."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "databricks-agentbricks==0.3.0",
+    "databricks-openai==0.17.1",
+    "databricks-sdk==0.144.0",
+    "openai==3.19.0",
+]
+
+[project.scripts]
+memory-demo = "memory_demo.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff", "pyright"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/memory_demo"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.pyright]
+include = ["src"]
+pythonVersion = "3.10"
+typeCheckingMode = "basic"
