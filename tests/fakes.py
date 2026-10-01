@@ -27,19 +27,34 @@ class FakeMemory:
 
 class FakeMemoryStore:
     def __init__(self) -> None:
+        self.name = "memory-stores/fake-memory"
         self.entries: list[FakeMemory] = []
         self.search_calls: list[dict[str, Any]] = []
 
-    def add(self, actor_id: str, path: str, content: str, description: str) -> FakeMemory:
-        entry = FakeMemory(actor_id, path, content, description, self)
+    def add(
+        self,
+        actor_id: str,
+        path: str,
+        content: str,
+        description: str,
+        session_id: str | None = None,
+    ) -> FakeMemory:
+        entry = FakeMemory(actor_id, path, content, description, self, session_id)
         self.entries.append(entry)
         return entry
 
-    def list(self, actor_id: str, path_prefix: str) -> list[FakeMemory]:
+    def list(
+        self,
+        actor_id: str,
+        path_prefix: str,
+        session_id: str | None = None,
+    ) -> list[FakeMemory]:
         return [
             entry
             for entry in self.entries
-            if entry.actor_id == actor_id and entry.path.startswith(path_prefix)
+            if entry.actor_id == actor_id
+            and entry.path.startswith(path_prefix)
+            and (session_id is None or entry.session_id == session_id)
         ]
 
     def search(
@@ -66,6 +81,8 @@ class FakeSession:
         self.items: list[dict[str, Any]] = []
         self.last_order = None
         self.reads = 0
+        self.extracted_memories: list[SimpleNamespace] = []
+        self.extraction_calls: list[dict[str, Any]] = []
 
     def append_items(self, items: list[dict[str, Any]]) -> None:
         self.items.extend(items)
@@ -77,6 +94,18 @@ class FakeSession:
 
     def delete(self) -> None:
         del self.store.entries[self.session_id]
+
+    def extract_memories(
+        self, memory_store: str, instructions: str, dry_run: bool
+    ) -> list[SimpleNamespace]:
+        self.extraction_calls.append(
+            {
+                "memory_store": memory_store,
+                "instructions": instructions,
+                "dry_run": dry_run,
+            }
+        )
+        return self.extracted_memories
 
 
 class FakeSessionStore:

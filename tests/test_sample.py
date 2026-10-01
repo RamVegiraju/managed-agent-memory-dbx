@@ -10,10 +10,19 @@ import pytest
 from databricks.sdk.service.serving import EndpointStateReady
 from databricks_agentbricks.errors import AgentCliError
 
-from memory_demo.agent import TOOLS, Agent, DatabricksModel
+from memory_demo.agent import (
+    END_SESSION_PROMPT,
+    MEMORY_PLAN_TOOL,
+    TOOLS,
+    Agent,
+    DatabricksModel,
+    end_session_memory,
+    reconcile_memories,
+)
 from memory_demo.backend import Backend, caller_id
 from memory_demo.cli import check_model, inspect, parser, validate
 from memory_demo.demo import run_demo
+from memory_demo.streamlit_ui import memory_output, session_output, visible_messages
 from tests.fakes import FakeMemoryStore, FakeSessionStore, ScriptedModel
 
 
@@ -33,6 +42,27 @@ def tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
                 "function": {"name": name, "arguments": json.dumps(arguments)},
             }
         ],
+    }
+
+
+def memory_plan(*decisions: dict[str, str]) -> dict[str, Any]:
+    return tool_call("submit_memory_plan", {"decisions": list(decisions)})
+
+
+def decision(
+    action: str,
+    path: str,
+    content: str,
+    evidence: str,
+    description: str = "User preference",
+) -> dict[str, str]:
+    return {
+        "action": action,
+        "path": path,
+        "content": content,
+        "description": description,
+        "reason": "Explicit user statement",
+        "evidence": evidence,
     }
 
 
@@ -114,16 +144,63 @@ def test_upsert_and_independent_deletion(backend: Backend) -> None:
     assert backend.memories() == []
 
 
+def test_end_session_managed_extraction_adds_canonical_memory(backend: Backend) -> None:
+    session = backend.new_session()
+    statement = "I prefer concise answers"
+    backend.append(session.session_id, [{"role": "user", "content": statement}])
+    path = "/memories/preferences/communication/verbosity.md"
+    session.extracted_memories = [
+        SimpleNamespace(
+            path=path,
+            content="Prefers concise answers.",
+            description="Response verbosity",
+            session_id=session.session_id,
+        )
+    ]
+    model = ScriptedModel(
+        [memory_plan(decision("ADD", path, "Prefers concise answers.", statement))]
+    )
+
+    result = end_session_memory(backend, model, session.session_id)
+
+    assert result[0]["action"] == "ADD"
+    assert len(backend.memories()) == 1
+    assert backend.memories()[0].session_id is None
+    assert backend.memories()[0].content == "Prefers concise answers."
+    assert session.extraction_calls[0]["dry_run"] is True
+    assert session.extraction_calls[0]["memory_store"] == "memory-stores/fake-memory"
+
+
 def test_memory_search_binds_actor_and_namespace(backend: Backend) -> None:
-    backend.memory_store.add("another-user", "/preferences/style.md", "private", "style")
+    backend.memory_store.add("another-user", "/memories/preferences/style.md", "private", "style")
     backend.remember("response-preferences", "PySpark examples")
     assert len(backend.recall("PySpark")) == 1
     assert backend.memory_store.search_calls[-1] == {
         "actor_id": "verified-user",
         "query": "PySpark",
-        "path_prefix": "/preferences/",
+        "path_prefix": "/memories/",
         "limit": 5,
     }
+
+
+def test_recall_excludes_session_associated_extraction_entries(backend: Backend) -> None:
+    backend.memory_store.add(
+        backend.actor_id,
+        "/memories/preferences/canonical.md",
+        "Concise answers",
+        "Response style",
+    )
+    backend.memory_store.add(
+        backend.actor_id,
+        "/memories/preferences/extracted.md",
+        "Concise draft",
+        "Response style",
+        session_id="old-session",
+    )
+
+    recalled = backend.recall("concise response")
+
+    assert [item["path"] for item in recalled] == ["/memories/preferences/canonical.md"]
 
 
 @pytest.mark.parametrize("topic", ["../other", "/preferences/other", "", "Bad Topic", "a" * 65])
@@ -220,17 +297,22 @@ def test_tool_schemas_have_no_identity_arguments() -> None:
         assert tool["function"]["parameters"]["additionalProperties"] is False
 
 
+def test_end_session_prompt_never_requires_manual_save_request() -> None:
+    assert "does not need to say" in END_SESSION_PROMPT
+    assert "Use remember only" not in END_SESSION_PROMPT
+
+
 def test_demo_leaves_other_namespaces_untouched(capsys: pytest.CaptureFixture[str]) -> None:
     sessions = FakeSessionStore()
     memories = FakeMemoryStore()
-    memories.add("verified-user", "/preferences/real.md", "real preference", "real")
+    memories.add("verified-user", "/memories/preferences/real.md", "real preference", "real")
 
     def factory(namespace: str) -> Backend:
         return Backend(sessions, memories, "verified-user", namespace)
 
     run_demo(factory, cleanup=True)
     assert len(memories.entries) == 1
-    assert memories.entries[0].path == "/preferences/real.md"
+    assert memories.entries[0].path == "/memories/preferences/real.md"
     assert sessions.entries == {}
     assert "Storage checks passed" in capsys.readouterr().out
 
@@ -353,6 +435,347 @@ def test_inspect_parser_uses_verbose_not_trace() -> None:
         parser().parse_args(["--profile", "chosen", "--trace", "doctor"])
 
 
+def test_streamlit_chat_hides_tool_protocol_messages() -> None:
+    history = [
+        {"role": "user", "content": "Remember concise answers"},
+        {"role": "assistant", "content": None, "tool_calls": []},
+        {"role": "tool", "content": '{"status": "created"}'},
+        {"role": "assistant", "content": "Remembered."},
+    ]
+    assert visible_messages(history) == [
+        {"role": "user", "content": "Remember concise answers"},
+        {"role": "assistant", "content": "Remembered."},
+    ]
+
+
+def test_streamlit_raw_outputs_expose_user_partitions(backend: Backend) -> None:
+    session = backend.new_session()
+    backend.remember("style", "Concise answers")
+
+    assert session_output(backend) == {
+        "user_id": "verified-user",
+        "sessions": [{"session_id": session.session_id, "create_time": None}],
+    }
+    assert memory_output(backend) == {
+        "user_id": "verified-user",
+        "memories": [
+            {
+                "path": "/memories/style.md",
+                "description": "style",
+                "content": "Concise answers",
+                "session_id": None,
+            }
+        ],
+    }
+
+
+def test_reconciliation_uses_only_user_statements_and_structured_tool() -> None:
+    path = "/memories/preferences/coding/examples.md"
+    statement = "I prefer SQL examples"
+    model = ScriptedModel([memory_plan(decision("ADD", path, "Prefers SQL examples.", statement))])
+    history = [
+        {"role": "user", "content": statement},
+        {"role": "assistant", "content": "I suggest Python"},
+        {"role": "tool", "content": "private tool output"},
+    ]
+
+    assert reconcile_memories(model, history, [], [], "/memories/") == [
+        decision("ADD", path, "Prefers SQL examples.", statement)
+    ]
+    payload = json.loads(model.calls[0]["messages"][1]["content"])
+    assert payload["user_statements"] == [statement]
+    assert payload["managed_extraction_candidates"] == []
+    assert payload["canonical_namespace"] == "/memories/"
+    assert model.calls[0]["tools"] == [MEMORY_PLAN_TOOL]
+    assert model.calls[0]["final"] is False
+
+
+def test_end_session_adds_multiple_atomic_memories(backend: Backend) -> None:
+    session = backend.new_session()
+    statement = "Keep answers concise, and use PySpark examples"
+    backend.append(session.session_id, [{"role": "user", "content": statement}])
+    verbosity = "/memories/preferences/communication/verbosity"
+    examples = "/memories/preferences/coding/example-framework"
+    session.extracted_memories = [
+        SimpleNamespace(
+            path=verbosity,
+            content="Prefers concise answers.",
+            description="Response verbosity",
+            session_id=session.session_id,
+        ),
+        SimpleNamespace(
+            path=examples,
+            content="Prefers PySpark examples.",
+            description="Example framework",
+            session_id=session.session_id,
+        ),
+    ]
+    model = ScriptedModel(
+        [
+            memory_plan(
+                decision("ADD", verbosity, "Prefers concise answers.", "Keep answers concise"),
+                decision("ADD", examples, "Prefers PySpark examples.", "use PySpark examples"),
+            )
+        ]
+    )
+
+    results = end_session_memory(backend, model, session.session_id)
+
+    assert [result["action"] for result in results] == ["ADD", "ADD"]
+    assert {memory.path for memory in backend.memories()} == {verbosity, examples}
+
+
+def test_end_session_supplies_existing_inventory_to_both_reasoning_steps(
+    backend: Backend,
+) -> None:
+    path = "/memories/preferences/coding/language"
+    backend.memory_store.add(backend.actor_id, path, "Prefers Python.", "Language")
+    session = backend.new_session()
+    statement = "I now prefer Scala"
+    backend.append(session.session_id, [{"role": "user", "content": statement}])
+    session.extracted_memories = [
+        SimpleNamespace(
+            path=path,
+            content="Prefers Scala.",
+            description="Language",
+            session_id=session.session_id,
+        )
+    ]
+    model = ScriptedModel(
+        [memory_plan(decision("UPDATE", path, "Prefers Scala.", statement, "Language"))]
+    )
+
+    end_session_memory(backend, model, session.session_id)
+
+    extraction_instructions = session.extraction_calls[0]["instructions"]
+    assert path in extraction_instructions
+    assert "Prefers Python." in extraction_instructions
+    payload = json.loads(model.calls[0]["messages"][1]["content"])
+    assert payload["existing_canonical_memories"] == [
+        {"path": path, "content": "Prefers Python.", "description": "Language"}
+    ]
+
+
+def test_reconciliation_remaps_managed_candidate_into_custom_namespace() -> None:
+    namespace = "/memories/demos/run/preferences/"
+    backend = Backend(FakeSessionStore(), FakeMemoryStore(), "verified-user", namespace)
+    session = backend.new_session()
+    statement = "I prefer concise answers"
+    backend.append(session.session_id, [{"role": "user", "content": statement}])
+    session.extracted_memories = [
+        SimpleNamespace(
+            path="/memories/profile.md",
+            content="Prefers concise answers.",
+            description="Response style",
+            session_id=session.session_id,
+        )
+    ]
+    canonical = f"{namespace}communication/verbosity"
+    model = ScriptedModel(
+        [memory_plan(decision("ADD", canonical, "Prefers concise answers.", statement))]
+    )
+
+    end_session_memory(backend, model, session.session_id)
+
+    assert backend.memories()[0].path == canonical
+    payload = json.loads(model.calls[0]["messages"][1]["content"])
+    assert payload["managed_extraction_candidates"][0]["path"] == "/memories/profile.md"
+    assert payload["canonical_namespace"] == namespace
+
+
+def test_end_session_refuses_foreign_session_before_extraction_or_model() -> None:
+    sessions = FakeSessionStore()
+    foreign = sessions.add(actor_id="another-user")
+    backend = Backend(sessions, FakeMemoryStore(), "verified-user")
+    model = ScriptedModel([])
+
+    with pytest.raises(PermissionError, match="authenticated caller"):
+        end_session_memory(backend, model, foreign.session_id)
+
+    assert foreign.extraction_calls == []
+    assert model.calls == []
+
+
+def test_end_session_update_and_explicit_delete(backend: Backend) -> None:
+    path = "/memories/preferences/coding/language.md"
+    backend.memory_store.add(
+        backend.actor_id, path, "Prefers Python.", "Preferred programming language"
+    )
+    update_session = backend.new_session()
+    update_statement = "I switched from Python to Scala"
+    backend.append(update_session.session_id, [{"role": "user", "content": update_statement}])
+    update_model = ScriptedModel(
+        [memory_plan(decision("UPDATE", path, "Prefers Scala.", update_statement))]
+    )
+    assert (
+        end_session_memory(backend, update_model, update_session.session_id)[0]["action"]
+        == "UPDATE"
+    )
+    assert backend.memories()[0].content == "Prefers Scala."
+
+    delete_session = backend.new_session()
+    delete_statement = "Forget my preferred programming language"
+    backend.append(delete_session.session_id, [{"role": "user", "content": delete_statement}])
+    delete_model = ScriptedModel([memory_plan(decision("DELETE", path, "", delete_statement, ""))])
+    assert (
+        end_session_memory(backend, delete_model, delete_session.session_id)[0]["action"]
+        == "DELETE"
+    )
+    assert backend.memories() == []
+
+
+def test_update_replaces_correction_and_preserves_compatible_facts(backend: Backend) -> None:
+    path = "/memories/preferences/coding/style"
+    backend.memory_store.add(
+        backend.actor_id,
+        path,
+        "Prefers Python examples and concise explanations.",
+        "Coding response style",
+    )
+    statement = "Use Scala instead of Python, but keep explanations concise"
+
+    backend.apply_memory_decisions(
+        [
+            decision(
+                "UPDATE",
+                path,
+                "Prefers Scala examples and concise explanations.",
+                statement,
+                "Coding response style",
+            )
+        ],
+        [statement],
+    )
+
+    assert backend.memories()[0].content == "Prefers Scala examples and concise explanations."
+
+
+def test_duplicate_path_plan_is_rejected_before_any_write(backend: Backend) -> None:
+    path = "/memories/preferences/communication/verbosity"
+    statement = "Keep answers concise"
+
+    with pytest.raises(ValueError, match="duplicate path"):
+        backend.apply_memory_decisions(
+            [
+                decision("ADD", path, "Prefers concise answers.", statement),
+                decision("ADD", path, "Prefers brief answers.", statement),
+            ],
+            [statement],
+        )
+
+    assert backend.memories() == []
+
+
+def test_invalid_later_decision_prevents_earlier_valid_write(backend: Backend) -> None:
+    statement = "Keep answers concise and use SQL examples"
+
+    with pytest.raises(ValueError, match="inside /memories/"):
+        backend.apply_memory_decisions(
+            [
+                decision(
+                    "ADD",
+                    "/memories/preferences/communication/verbosity",
+                    "Prefers concise answers.",
+                    "Keep answers concise",
+                ),
+                decision(
+                    "ADD",
+                    "/outside/preferences/coding/examples",
+                    "Prefers SQL examples.",
+                    "use SQL examples",
+                ),
+            ],
+            [statement],
+        )
+
+    assert backend.memories() == []
+
+
+def test_memory_plan_rejects_delete_without_verbatim_user_evidence(backend: Backend) -> None:
+    path = "/memories/preferences/coding/language.md"
+    backend.memory_store.add(backend.actor_id, path, "Prefers Python.", "Language")
+    with pytest.raises(ValueError, match="verbatim evidence"):
+        backend.apply_memory_decisions(
+            [decision("DELETE", path, "", "user asked to forget", "")],
+            ["Tell me about Python"],
+        )
+    assert len(backend.memories()) == 1
+
+
+def test_noop_conflict_and_omission_preserve_existing_memories(backend: Backend) -> None:
+    verbosity = "/memories/preferences/communication/verbosity.md"
+    language = "/memories/preferences/coding/language.md"
+    backend.memory_store.add(backend.actor_id, verbosity, "Prefers concise answers.", "Verbosity")
+    backend.memory_store.add(backend.actor_id, language, "Prefers Python.", "Language")
+
+    results = backend.apply_memory_decisions(
+        [
+            decision(
+                "NO_OP",
+                verbosity,
+                "Likes brief responses.",
+                "",
+                "Response verbosity",
+            ),
+            decision(
+                "CONFLICT",
+                language,
+                "",
+                "",
+                "Preferred programming language",
+            ),
+        ],
+        ["Maybe use Scala sometimes"],
+    )
+
+    assert [result["action"] for result in results] == ["NO_OP", "CONFLICT"]
+    assert {memory.content for memory in backend.memories()} == {
+        "Prefers concise answers.",
+        "Prefers Python.",
+    }
+
+
+def test_empty_plan_never_deletes_unmentioned_memory(backend: Backend) -> None:
+    path = "/memories/preferences/communication/verbosity.md"
+    backend.memory_store.add(backend.actor_id, path, "Prefers concise answers.", "Verbosity")
+
+    assert backend.apply_memory_decisions([], ["Hello there"]) == []
+    assert backend.memories()[0].path == path
+
+
+def test_extensionless_managed_path_is_valid(backend: Backend) -> None:
+    path = "/memories/profile/identity-and-interests"
+    statement = "I am an engineer in Brooklyn who enjoys tennis"
+
+    result = backend.apply_memory_decisions(
+        [decision("ADD", path, "Engineer in Brooklyn who enjoys tennis.", statement)],
+        [statement],
+    )
+
+    assert result[0]["action"] == "ADD"
+    assert backend.memories()[0].path == path
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        "/other/preferences/style.md",
+        "/memories/preferences/../private.md",
+        "/memories/preferences/Bad Topic.md",
+        "/memories/preferences/trailing/",
+    ],
+)
+def test_reconciliation_rejects_paths_outside_canonical_schema(
+    backend: Backend, bad_path: str
+) -> None:
+    with pytest.raises(ValueError, match="path"):
+        backend.apply_memory_decisions(
+            [decision("ADD", bad_path, "Preference", "I prefer it")],
+            ["I prefer it"],
+        )
+    assert backend.memories() == []
+
+
 def test_model_uses_selected_endpoint_and_no_tool_calls_on_last_round() -> None:
     calls: list[dict[str, Any]] = []
 
@@ -368,6 +791,30 @@ def test_model_uses_selected_endpoint_and_no_tool_calls_on_last_round() -> None:
     assert calls[0]["model"] == "selected-endpoint"
     assert calls[0]["tool_choice"] == "none"
     assert "reasoning_effort" not in calls[0]
+
+
+def test_reconciliation_forces_structured_plan_tool() -> None:
+    calls: list[dict[str, Any]] = []
+
+    def create(**kwargs: Any) -> SimpleNamespace:
+        calls.append(kwargs)
+        tool_call = SimpleNamespace(
+            id="plan",
+            function=SimpleNamespace(name="submit_memory_plan", arguments='{"decisions":[]}'),
+        )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[tool_call]))]
+        )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    DatabricksModel(client, "selected-endpoint").complete(
+        [{"role": "user", "content": "Plan"}], [MEMORY_PLAN_TOOL], False
+    )
+
+    assert calls[0]["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "submit_memory_plan"},
+    }
 
 
 def test_optional_reasoning_effort_is_forwarded() -> None:

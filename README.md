@@ -1,191 +1,147 @@
-# Managed sessions + memory: a small support copilot
+# Databricks managed sessions + memory
 
-A framework-independent Python sample of the **new** Databricks managed agent APIs,
-using `AgentKitClient` for storage and `DatabricksOpenAI` for a tool-calling chat model.
-No workspace URL, organization ID, endpoint name, or local user identity is embedded in the code.
-The sample runs on a laptop or any Python environment with access to an enabled Databricks workspace.
+A small, workspace-agnostic Python and Streamlit sample showing:
 
-| Managed sessions | Managed memory |
-| --- | --- |
-| The ordered transcript for one conversation | Selected durable facts/preferences across conversations |
-| Reloaded on every turn; survives process restarts | Recalled through relevance-ranked search |
-| Messages, model tool calls, and tool results | Small entries at stable topic paths |
-| A new session starts with an empty transcript | A new session can recall the same caller's preferences |
+- **Managed sessions:** complete conversation history for one thread.
+- **Managed memory:** durable, user-scoped facts and preferences across threads.
+- **End-session maintenance:** managed extraction followed by structured semantic reconciliation.
 
-**Retrieval caveat:** the current detailed docs specify **BM25 full-text search**, not vector
-similarity. Although the introduction mentions semantic search, this sample does not claim
-embedding-based or guaranteed synonym retrieval. Short descriptions and meaningful query terms matter.
+No workspace URL, user ID, or model endpoint is hard-coded. Store defaults are configurable.
 
-## Run the sample
+## Quickstart
 
-Requirements: Python 3.10+, [uv](https://docs.astral.sh/uv/getting-started/installation/),
-the Databricks CLI, an enabled workspace, and permission to use a tool-calling chat endpoint.
-
-### 1. Install and authenticate
+Requirements: Python 3.10+, [uv](https://docs.astral.sh/uv/), the Databricks CLI, an enabled
+workspace, and access to a tool-calling chat endpoint.
 
 ```bash
-uv sync
-databricks auth login --host https://YOUR-WORKSPACE --profile YOUR_PROFILE
+uv sync --group dev
+
+databricks auth login \
+  --host https://YOUR-WORKSPACE \
+  --profile YOUR_PROFILE
+
 export DATABRICKS_CONFIG_PROFILE=YOUR_PROFILE
-uv run memory-demo doctor
-```
-
-`doctor` is read-only. It prints the authenticated user ID, available chat endpoints, and existing
-session and memory stores. It does not create resources or invoke a model.
-
-### 2. Configure the model and stores
-
-Choose an endpoint printed by `doctor`:
-
-```bash
 export DATABRICKS_MODEL=YOUR_CHAT_ENDPOINT
-# Required for GPT-5.6-Sol tool calls; omit for models that do not support this option.
+
+# GPT-5.6-Sol requires this for tool calls; omit it for models that do not.
 export DATABRICKS_REASONING_EFFORT=none
 
-# Run once. This creates only the two missing stores.
+# Read-only discovery of identity, models, and stores.
+uv run memory-demo doctor
+
+# Run once if the default stores do not exist.
 uv run memory-demo init --yes
+
+uv run streamlit run streamlit_app.py
 ```
 
-**Cost:** `init --yes` can provision billable Lakebase backing. Chat and demo commands only open
-existing stores. The defaults are `memory-demo-sessions` and `memory-demo-memory`.
+`init --yes` may provision billable Lakebase backing. Running the app only opens existing stores.
+The defaults are `memory-demo-sessions` and `memory-demo-memory`; override them with
+`DEMO_SESSION_STORE` and `DEMO_MEMORY_STORE`.
 
-### 3. Demonstrate cross-session memory
+## Try the UI
 
-```bash
-uv run memory-demo --verbose chat
+1. Share separate preferences, such as “Keep answers concise” and “Use PySpark examples.”
+2. Click **End session and capture memory**.
+3. Open **Last memory plan** to see each `ADD`, `UPDATE`, `NO_OP`, `DELETE`, or `CONFLICT` decision.
+4. Inspect the atomic entries under **User memories**.
+5. Start a fresh conversation and ask for a personalized answer.
+6. Correct or explicitly forget a preference, end the session, and inspect the resulting update.
+
+The UI gets identity from the configured CLI profile; it never accepts an arbitrary `actor_id`.
+To demonstrate isolation, restart it with a profile authenticated as another user.
+A managed session is created lazily with the first message, so opening or reconnecting the app does
+not create empty records.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    U[Authenticated user] --> UI[Streamlit UI]
+    UI --> A[Agent + chat model]
+    A -->|list_items / append_items| S[(Managed session store)]
+    A -->|search relevant entries| M[(Managed memory store)]
+    UI -->|End session| E[extract_memories dry run]
+    S --> E --> R[Structured reconciliation]
+    M -->|existing canonical entries| R
+    R --> V[Deterministic validation]
+    V -->|add / update / delete| M
 ```
 
-Enter the following, approving the memory write with `y`:
+Databricks manages the Lakebase-backed session and memory stores. Application code supplies the
+authenticated `actor_id` and store names; model-proposed paths are namespace-constrained and
+validated before writes.
 
-```text
-Remember that I prefer concise answers with PySpark examples.
-/memories
-/new
-/history
-Use my saved response preferences to explain deduplication.
-/sessions
-```
+On each chat turn:
 
-What this proves:
+1. `MemoryStore.search` retrieves only relevant canonical memories.
+2. The agent answers using the current session plus those results.
+3. `Session.append_items` stores the completed turn.
 
-- `/new` creates a different session and `/history` initially returns `[]`.
-- The verbose `[memory.searched]` event shows the agent calling managed memory.
-- The new session still uses the preference saved in the first session.
-- `/sessions` lists both transcripts while `/memories` lists the independent durable preference.
+When a session ends:
 
-For a process-restart check, run `/quit`, start `chat` again, and ask for an answer using your saved
-preferences. The memory remains because it is partitioned by authenticated user, not session ID.
+1. `Session.extract_memories(dry_run=True)` proposes atomic candidates and logical paths.
+2. A structured model call compares the transcript, candidates, and current canonical memories.
+3. Application validation checks paths, operations, identity scope, and verbatim user evidence.
+4. `MemoryStore.add`, `Memory.update`, or `Memory.delete` applies valid decisions.
 
-### 4. Retrieve persisted data
+Canonical entries use stable logical paths such as
+`/memories/preferences/communication/verbosity.md`. Session history preserves provenance; memory
+holds only the latest consolidated state. Omission never deletes a memory, and ambiguous changes are
+left untouched.
 
-Copy the user ID printed by `doctor`:
+## Inspect persisted data
 
 ```bash
 uv run memory-demo inspect --user-id YOUR_DATABRICKS_USER_ID
-```
 
-Copy a `session_id` from the returned `sessions` array to retrieve its complete history:
-
-```bash
 uv run memory-demo inspect \
   --user-id YOUR_DATABRICKS_USER_ID \
   --session-id YOUR_SESSION_ID
 ```
 
-The output is JSON. The sample permits only the authenticated caller's user ID; it does not permit
-arbitrary cross-user access.
+The requested user ID must match the authenticated caller. The first command lists that user's
+sessions and memories; the second also returns one complete session transcript.
 
-### 5. Run the automated showcase
+## Other commands
 
 ```bash
-# Real storage APIs, no model cost
-uv run memory-demo --verbose demo --storage-only --cleanup
+# Terminal chat with approved recall/remember/forget tools.
+uv run memory-demo --verbose chat
 
-# Real storage APIs plus model responses
+# Isolated managed-storage checks, optionally including model responses.
+uv run memory-demo --verbose demo --storage-only --cleanup
 uv run memory-demo --verbose demo --cleanup
 ```
 
-The demo verifies session reload, a fresh empty session, cross-session recall, update, independent
-session deletion, and explicit forgetting. It uses an isolated namespace. `--cleanup` removes only
-that run's sessions and entries; it does not delete the stores or their backing infrastructure.
+Terminal chat commands are `/new`, `/resume ID`, `/sessions`, `/history`, `/memories`, and `/quit`.
+Demo cleanup removes only that run's entries and sessions, never either store or its backing project.
 
-## Memory tools
-
-The model receives three simple function tools defined in `src/memory_demo/agent.py`:
-
-| Tool | Managed-memory operation |
-| --- | --- |
-| `recall(query)` | Search this user's durable entries |
-| `remember(topic, content)` | Create or update one stable topic after approval |
-| `forget(topic)` | Delete one stable topic after approval |
-
-This intentionally combines lower-level create/get/list/update/delete operations into a smaller
-agent interface. Memory extraction is not automatic: the model must call `remember`, and durable
-facts are available in a new session only after it calls `recall`.
-
-## Configuration
-
-There is no automatic `DEFAULT` profile or hard-coded model. Environment variables can be replaced
-with global flags placed **before** the subcommand:
+## Test
 
 ```bash
-uv run memory-demo --profile YOUR_PROFILE --model YOUR_CHAT_ENDPOINT \
-  --session-store YOUR_SESSIONS --memory-store YOUR_MEMORY --verbose demo --cleanup
-```
-
-Commands: `doctor`, `init`, `chat`, `inspect`, and `demo`. Run `uv run memory-demo --help` for all
-global options. In chat, use `/new`, `/resume ID`, `/sessions`, `/history`, `/memories`, or `/quit`.
-`--verbose` can print user memory contents; do not share its output or use sensitive demo data.
-
-## Code map
-
-- `src/memory_demo/backend.py`: AgentKit operations, identity binding, ownership checks,
-  chronological replay, and canonical-topic updates.
-- `src/memory_demo/agent.py`: a bounded chat/tool loop; only `recall`, `remember`, and `forget`.
-- `src/memory_demo/demo.py`: inspectable storage acceptance checks and optional model conversations.
-- `src/memory_demo/cli.py`: explicit configuration, read-only discovery, provisioning consent,
-  and terminal chat controls.
-
-## Safety and limitations
-
-- **`actor_id` is not authorization.** Both stores authorize at the store level; anyone with access
-  can access other actors through the API. Use separate stores for strict security boundaries.
-- This is a single-caller CLI. A multi-user application must supply verified end-user identity and
-  enforce its own authorization boundaries.
-- Retrieved memories are untrusted input. All model-requested memory changes require local approval.
-- The sample supports one writer per conversation and does not summarize oversized histories.
-- A failed request may already have committed. Inspect the session or memory before retrying a write.
-
-## Live validation
-
-The sample passed live storage checks, the full GPT-5.6-Sol demo, interactive memory approvals,
-and an actual chat-process restart/resume on September 30, 2026. Dedicated validation stores
-were deleted afterward; existing workspace stores were untouched. See [VALIDATION.md](VALIDATION.md)
-for results, model compatibility fixes, cleanup details, and reproduction steps.
-
-## Tests
-
-```bash
-uv sync --group dev
 uv run pytest
 uv run ruff check .
 uv run ruff format --check .
 uv run pyright
 ```
 
-Tests use explicit test doubles, do not authenticate, and never create paid infrastructure.
-Use `doctor` and the storage-only demo for opt-in real workspace verification.
+Tests cover session replay, user isolation, managed extraction transport, atomic multi-memory plans,
+all reconciliation actions, pre-write validation, cross-session recall, and Streamlit session flows.
 
-The direct SDK dependencies are pinned to the versions tested here. A machine-specific lockfile
-is not shipped: `uv sync` generates one against your configured package index, without requiring
-an internal Databricks package mirror. Transitive dependencies can still change between installs.
+## Safety
 
-## Authoritative references
+- `actor_id` groups data but is not authorization; derive it from trusted authentication context.
+- Retrieved memory and session text is untrusted data and cannot override application instructions.
+- Canonical paths are application-scoped and validated before writes.
+- Deletion requires explicit user-authored evidence; missing or conflicting information is preserved.
+- The sample assumes one memory-maintenance writer per user at a time.
+- Managed sessions and memory are Beta APIs and may change.
 
-The guides were reviewed on September 30, 2026. Preview APIs and workspace availability may change.
+## References
 
-- [Managed agent sessions](https://docs.databricks.com/aws/en/agents/agent-memory/managed-sessions)
 - [Managed agent memory](https://docs.databricks.com/aws/en/agents/agent-memory/managed-memory)
-- [AgentKit SDK reference](https://github.com/databricks/databricks-ai-bridge/blob/main/integrations/agentbricks/README.md#agentkit-sdk)
-- [Public REST transport source](https://github.com/databricks/databricks-ai-bridge/blob/main/integrations/agentbricks/src/databricks_agentkit/_api_client.py)
-- [DatabricksOpenAI client](https://api-docs.databricks.com/python/databricks-ai-bridge/latest/databricks_openai.html#databricks_openai.DatabricksOpenAI)
+- [Managed agent sessions](https://docs.databricks.com/aws/en/agents/agent-memory/managed-sessions)
+- [Memory: Scaling AI agents](https://www.databricks.com/blog/memory-scaling-ai-agents)
+- [Agent API reference](https://docs.databricks.com/api/workspace/)
+- [AgentKit SDK](https://github.com/databricks/databricks-ai-bridge/tree/main/integrations/agentbricks)

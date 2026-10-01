@@ -220,11 +220,11 @@ def main() -> int:
         if arguments.command == "demo":
             run_demo(factory, model, arguments.cleanup)
         elif arguments.command == "inspect":
-            inspect(factory("/preferences/"), arguments.user_id, arguments.session_id)
+            inspect(factory("/memories/"), arguments.user_id, arguments.session_id)
         else:
             if model is None:
                 raise ValueError("A chat model endpoint is required.")
-            chat(factory("/preferences/"), model, arguments.session_id)
+            chat(factory("/memories/"), model, arguments.session_id)
         return 0
     except (
         ValueError,

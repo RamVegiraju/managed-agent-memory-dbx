@@ -13,6 +13,7 @@ dependencies = [
     "databricks-openai==0.17.1",
     "databricks-sdk==0.144.0",
     "openai==3.19.0",
+    "streamlit>=1.38,<2",
 ]
 
 [project.scripts]

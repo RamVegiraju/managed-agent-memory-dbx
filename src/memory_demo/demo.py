@@ -27,7 +27,7 @@ def run_demo(factory: Factory, model: Model | None = None, cleanup: bool = False
         cleanup: Remove this run's sessions and memory, but never delete either store.
     """
     run_id = uuid4().hex[:12]
-    namespace = f"/demos/{run_id}/preferences/"
+    namespace = f"/memories/demos/{run_id}/preferences/"
     backend = factory(namespace)
     session_ids: list[str] = []
     print(f"\nDemo run: {run_id}\nMemory namespace: {namespace}")
@@ -72,7 +72,7 @@ def run_demo(factory: Factory, model: Model | None = None, cleanup: bool = False
         recalled = restored.recall("response preferences PySpark")
         check(
             any("PySpark" in (memory["content"] or "") for memory in recalled),
-            "BM25 search recalls saved preferences across sessions",
+            "Managed search recalls saved preferences across sessions",
         )
         check(
             all("nightly-orders" not in (memory.content or "") for memory in restored.memories()),

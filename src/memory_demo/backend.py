@@ -37,7 +37,7 @@ class Backend:
         session_store: SessionStore,
         memory_store: MemoryStore,
         actor_id: str,
-        namespace: str = "/preferences/",
+        namespace: str = "/memories/",
         observer: ActivityObserver = quiet_observer,
     ) -> None:
         if not actor_id.strip():
@@ -51,7 +51,7 @@ class Backend:
         self.observer = observer
 
     def new_session(self) -> Session:
-        """Create a caller-chosen ID and recover a committed create with bounded reads."""
+        """Call `SessionStore.add` and recover a committed create with bounded reads."""
         session_id = str(uuid4())
         self.observer("session.creating", {"session_id": session_id})
         try:
@@ -75,20 +75,20 @@ class Backend:
         return session
 
     def session(self, session_id: str) -> Session:
-        """Verify ownership before exposing a conversation or any of its items."""
+        """Call `SessionStore.get`, then verify ownership before exposing the session."""
         session = self.session_store.get(session_id)
         if session.actor_id != self.actor_id:
             raise PermissionError("This session does not belong to the authenticated caller.")
         return session
 
     def sessions(self) -> list[Session]:
-        """List only this caller's sessions, independent of server filter syntax."""
+        """Call `SessionStore.list` and return only the authenticated caller's sessions."""
         return [
             session for session in self.session_store.list() if session.actor_id == self.actor_id
         ]
 
     def history(self, session_id: str) -> list[dict[str, Any]]:
-        """Rebuild a conversation from chronological, auto-paginated session items."""
+        """Call `Session.list_items` and rebuild the auto-paginated chronological transcript."""
         items = self.session(session_id).list_items(order_by="create_time asc")
         history = []
         for item in items:
@@ -103,21 +103,25 @@ class Backend:
         return history
 
     def append(self, session_id: str, messages: list[dict[str, Any]]) -> None:
-        """Append one completed turn, including any memory tool calls and results."""
+        """Call `Session.append_items` with a completed turn and its memory tool protocol."""
         self.session(session_id).append_items(messages)
         self.observer("session.appended", {"session_id": session_id, "items": len(messages)})
 
     def delete_session(self, session_id: str) -> None:
-        """Delete one owned session, without cascading to branches or touching memory."""
+        """Call `Session.delete` without cascading to branches or touching memory."""
         self.session(session_id).delete()
         self.observer("session.deleted", {"session_id": session_id})
 
     def memories(self) -> list[Memory]:
-        """Inspect memory through the list API, not a relevance-limited search."""
-        return list(self.memory_store.list(actor_id=self.actor_id, path_prefix=self.namespace))
+        """List canonical user memories; session transcripts retain their provenance."""
+        return [
+            memory
+            for memory in self.memory_store.list(actor_id=self.actor_id, path_prefix=self.namespace)
+            if memory.session_id is None
+        ]
 
     def recall(self, query: str) -> list[dict[str, Any]]:
-        """Search the caller's namespace with BM25 relevance-ranked retrieval."""
+        """Call `MemoryStore.search` (`entries:search`) for relevance-ranked user recall."""
         if not isinstance(query, str) or not query.strip():
             raise ValueError("A non-empty memory query is required.")
         results = self.memory_store.search(
@@ -131,12 +135,13 @@ class Backend:
                 "score": result.score,
             }
             for result in results
+            if result.memory.session_id is None
         ]
         self.observer("memory.searched", {"query": query, "results": recalled})
         return recalled
 
     def remember(self, topic: str, content: str) -> dict[str, str]:
-        """Create or update one canonical preference after application approval."""
+        """Call `MemoryStore.add` or `Memory.update` for one approved canonical topic."""
         path = self._path(topic)
         if not isinstance(content, str) or not content.strip():
             raise ValueError("Memory content must be a non-empty string.")
@@ -157,7 +162,7 @@ class Backend:
         return {"status": action, "path": path}
 
     def forget(self, topic: str) -> dict[str, str]:
-        """Delete one canonical preference, leaving past transcripts unchanged."""
+        """Call `Memory.delete` for one topic while leaving session transcripts unchanged."""
         path = self._path(topic)
         existing = self._find(path)
         if existing:
@@ -165,10 +170,115 @@ class Backend:
         self.observer("memory.forgotten", {"path": path, "existed": existing is not None})
         return {"status": "deleted" if existing else "not_found", "path": path}
 
+    def extract_memories(self, session_id: str, instructions: str) -> list[dict[str, Any]]:
+        """Call managed `Session.extract_memories` in dry-run mode for atomic candidates."""
+        extracted = self.session(session_id).extract_memories(
+            memory_store=self.memory_store.name,
+            instructions=instructions,
+            dry_run=True,
+        )
+        candidates = [
+            {
+                "path": memory.path,
+                "content": memory.content,
+                "description": memory.description,
+                "source_session_id": memory.session_id,
+            }
+            for memory in extracted
+        ]
+        self.observer(
+            "memory.extracted",
+            {"session_id": session_id, "dry_run": True, "candidates": candidates},
+        )
+        return candidates
+
+    def apply_memory_decisions(
+        self,
+        decisions: list[dict[str, str]],
+        user_statements: list[str],
+    ) -> list[dict[str, str]]:
+        """Validate a semantic plan completely, then execute managed memory mutations."""
+        existing_by_path = {memory.path: memory for memory in self.memories()}
+        seen_paths: set[str] = set()
+        mutating = {"ADD", "UPDATE", "DELETE"}
+
+        for decision in decisions:
+            action = decision["action"]
+            path = decision["path"]
+            if path in seen_paths:
+                raise ValueError(f"The reconciliation plan contains duplicate path {path}.")
+            seen_paths.add(path)
+            self._validate_path(path)
+            exists = path in existing_by_path
+            if action == "ADD" and exists:
+                raise ValueError(f"ADD targets existing memory {path}; use UPDATE or NO_OP.")
+            if action in {"UPDATE", "DELETE", "NO_OP"} and not exists:
+                raise ValueError(f"{action} targets missing memory {path}.")
+            if action in {"ADD", "UPDATE"} and (
+                not decision["content"].strip() or not decision["description"].strip()
+            ):
+                raise ValueError(f"{action} requires non-empty content and description.")
+            if action in mutating:
+                evidence = decision["evidence"].strip()
+                if not evidence or not any(evidence in statement for statement in user_statements):
+                    raise ValueError(
+                        f"{action} for {path} lacks verbatim evidence from a user message."
+                    )
+
+        results: list[dict[str, str]] = []
+        for decision in decisions:
+            action = decision["action"]
+            path = decision["path"]
+            applied = action
+            if action == "ADD":
+                self.memory_store.add(
+                    actor_id=self.actor_id,
+                    path=path,
+                    content=decision["content"].strip(),
+                    description=decision["description"].strip(),
+                )
+            elif action == "UPDATE":
+                existing = existing_by_path[path]
+                if self._normalized(existing.content) == self._normalized(decision["content"]):
+                    applied = "NO_OP"
+                else:
+                    existing.update(
+                        content=decision["content"].strip(),
+                        description=decision["description"].strip(),
+                    )
+            elif action == "DELETE":
+                existing_by_path[path].delete()
+            result = {
+                "action": applied,
+                "requested_action": action,
+                "path": path,
+                "content": decision["content"],
+                "description": decision["description"],
+                "reason": decision["reason"],
+                "evidence": decision["evidence"],
+            }
+            results.append(result)
+            self.observer(f"memory.reconciled_{applied.lower()}", result)
+        return results
+
     def _path(self, topic: str) -> str:
         if not isinstance(topic, str) or not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", topic):
             raise ValueError("Topic must be 1–64 lowercase letters, numbers, or hyphens.")
         return f"{self.namespace}{topic}.md"
+
+    def _validate_path(self, path: str) -> None:
+        """Require a canonical, nested Markdown-like identifier inside this app's namespace."""
+        if not isinstance(path, str) or len(path) > 1024 or not path.startswith(self.namespace):
+            raise ValueError(f"Memory path must be inside {self.namespace}.")
+        relative = path.removeprefix(self.namespace)
+        segment = r"[a-z][a-z0-9-]{0,63}"
+        if not re.fullmatch(rf"(?:{segment}/)*{segment}(?:\.md)?", relative):
+            raise ValueError(f"Invalid canonical memory path: {path}.")
+
+    @staticmethod
+    def _normalized(content: str | None) -> str:
+        """Normalize line endings and surrounding whitespace for deterministic no-op checks."""
+        return (content or "").replace("\r\n", "\n").strip()
 
     def _find(self, path: str) -> Memory | None:
         matches = [
@@ -193,7 +303,7 @@ def connect(
     workspace: WorkspaceClient,
     session_store: str,
     memory_store: str,
-    namespace: str = "/preferences/",
+    namespace: str = "/memories/",
     observer: ActivityObserver | None = None,
 ) -> Backend:
     """Open existing stores; never provision infrastructure implicitly."""
